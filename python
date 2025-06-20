@@ -1,7 +1,5 @@
 import pandas as pd
-from sqlalchemy import create_engine, Column, String, Boolean
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import create_engine, text
 import sys
 import os
 
@@ -9,84 +7,124 @@ import os
 DB_USER = os.getenv("DB_USER", "jun") 
 DB_PASSWORD = os.getenv("DB_PASSWORD", "Pub1234Adobe")
 DB_HOST = os.getenv("DB_HOST", "157.230.251.229")
-DB_PORT = os.getenv("DB_PORT", 5432)
+DB_PORT = int(os.getenv("DB_PORT", 5432)) # 文字列から整数に変換
 DB_NAME = os.getenv("DB_NAME", "adobepub_dev")
 
 # 1. データベース接続設定
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-engine = create_engine(DATABASE_URL, echo=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+engine = create_engine(DATABASE_URL, echo=False) 
 
-# Segmentテーブルに対応するモデルクラス
-class Segment(Base):
-    __tablename__ = 'Segment'
-    __table_args__ = {'schema': 'master'}
-    segment_id = Column(String(100), primary_key=True)
-    segment_name = Column(String(255))
+# --- 設定項目 ---
+CSV_FILE_PATH = 'dv360_data.csv'
+SCHEMA_NAME = 'platform'
+TABLE_NAME = 'DV360_dev'
 
-# 2. マスターCSVファイルを読み込む
-CSV_FILE_PATH = 'segment_master.csv'
-try:
-    df_segment = pd.read_csv(CSV_FILE_PATH)
-except FileNotFoundError:
-    print(f"エラー: {CSV_FILE_PATH} が見つかりません。")
-    sys.exit(1)
+# --- メイン処理 ---
+def main():
+    print(f"--- {SCHEMA_NAME}.{TABLE_NAME} へのデータ追記処理を開始します ---")
 
-# 【安全チェック】DataFrameが空（行数が0）かどうかをチェック
-if df_segment.empty:
-    print(f"警告: {CSV_FILE_PATH} ファイルが空か、ヘッダーしかありません。")
-    print("テーブルの全データが削除されるのを防ぐため、処理を中断します。")
-    sys.exit(0)
+    # 1. CSVファイルをPandasで読み込む
+    try:
+        print(f"読み込み中: {CSV_FILE_PATH}")
+        df = pd.read_csv(CSV_FILE_PATH)
+    except FileNotFoundError:
+        print(f"エラー: {CSV_FILE_PATH} が見つかりません。")
+        sys.exit(1)
+    
+    if df.empty:
+        print("情報: CSVファイルが空です。追記するデータはありません。")
+        sys.exit(0)
+    
+    print(f"{len(df)}件のデータを読み込みました。")
 
-# 3. CSVに存在するIDのリスト（Set）を作成する
-csv_ids = set(df_segment['segment_id'])
-print(f"CSVに存在するIDの数: {len(csv_ids)}")
+    # ===【データの前処理】===
 
-# 4. セッションを開始して同期処理を実行
-session = SessionLocal()
-try:
-    # --- ステップ1: UPSERT処理 ---
-    for index, row in df_segment.iterrows():
-        segment_obj = session.query(Segment).filter(Segment.segment_id == row['segment_id']).first()
+    # 2. カラム名をDBの列名にリネームする
+    column_mapping = {
+        'platform_r': 'platform_name', #【修正】元のplatform_nameのマッピングを追加
+        'Date': 'date',
+        'Daily': 'date', #【修正】カンマを追加
+        'Day (YYYY-MM-DD)': 'date', #【修正】カンマを追加
+        'Day': 'date', #【修正】カンマを追加
+        'Campaign': 'campaign_name',
+        'Campaign Name': 'campaign_name', #【修正】カンマを追加
+        'Campaign name': 'campaign_name',
+        'Insertion Order': 'insertion_order',
+        'Package Name': 'insertion_order',
+        'n/a': 'insertion_order',
+        'Line Item': 'line_item_name',
+        'Ad Group Name': 'line_item_name',
+        'Ad group': 'line_item_name',
+        'Placement Name': 'line_item_name',
+        'Ad Set Name': 'line_item_name',
+        'Creative': 'creative_name',
+        'Ad Name': 'creative_name',
+        'Ad ID': 'creative_name',
+        'Creative Name': 'creative_name',
+        'Revenue (Adv Currency)': 'spend',
+        'Cost': 'spend',
+        'Spend': 'spend',
+        'Total Net Spend': 'spend',
+        'Budget Delivered': 'spend',
+        'Impressions': 'imps',
+        'Clicks': 'clicks',
+        'Total Ad Clicks': 'clicks',
+        'Clicks (Advanced IVT)': 'clicks',
+        'Total Conversions': 'conversions',
+        'Conversions': 'conversions',
+        'Click Conversions': 'conversions',
+        'Results': 'conversions'
+    }
+    df.rename(columns=column_mapping, inplace=True)
+
+    #【修正】この処理ブロックをmain()関数の中に移動
+    # DBに存在する列名のリストを定義
+    db_columns = [
+        'platform_name', 'date', 'campaign_name', 'insertion_order',
+        'line_item_name', 'creative_name', 'spend', 'imps', 'clicks', 'conversions'
+    ]
+    # DataFrameを、DBに存在する列のみに絞り込む
+    # これにより、不要な列（リネームされなかった列など）が取り除かれる
+    final_columns = [col for col in db_columns if col in df.columns]
+    df = df[final_columns]
+    
+    # 3. 日付列を日付型に変換する
+    if 'date' in df.columns:
+        try:
+            df['date'] = pd.to_datetime(df['date'])
+        except Exception as e:
+            print(f"エラー: 'date'列の日付フォーマット変換に失敗しました。")
+            print(f"詳細: {e}")
+            sys.exit(1)
+    else:
+        print("警告: 'date'カラムが見つかりませんでした。日付変換をスキップします。")
         
-        if segment_obj:
-            # UPDATE
-            segment_obj.segment_name = row['segment_name']
-            # is_activeカラムを更新する場合
-            # if 'is_active' in row:
-            #     segment_obj.is_active = row['is_active']
-        else:
-            # INSERT
-            new_segment = Segment(
-                segment_id=row['segment_id'],
-                segment_name=row['segment_name']
-                # is_active=row.get('is_active', True)
-            )
-            session.add(new_segment)
+    print("データの前処理（リネームと日付変換）が完了しました。")
+    # =================================
 
-    # --- ステップ2: 削除処理 ---
-    db_segments = session.query(Segment).all()
-    
-    delete_count = 0
-    for db_seg in db_segments:
-        if db_seg.segment_id not in csv_ids:
-            print(f"削除対象: {db_seg.segment_id} ({db_seg.segment_name})")
-            session.delete(db_seg)
-            delete_count += 1
-    
-    if delete_count > 0:
-        print(f"--- {delete_count}件のレコードが削除されます。 ---")
+    # 4. データベースに接続して追記
+    try:
+        #【修正】冗長なcreate_engineを削除し、グローバルなengineを使用
+        with engine.connect() as connection:
+            print("データベースに接続しました。")
+            with connection.begin() as transaction:
+                print("CSVデータの追記を開始します...")
+                df.to_sql(
+                    name=TABLE_NAME,
+                    con=connection,
+                    schema=SCHEMA_NAME,
+                    if_exists='append',
+                    index=False
+                )
+                print("データの追記が完了しました。")
 
-    # 5. すべての変更（INSERT, UPDATE, DELETE）をまとめてDBにコミット
-    session.commit()
-    print("Segmentテーブルの完全同期が完了しました。")
+    except Exception as e:
+        print(f"！！！データベースへの書き込み中にエラーが発生しました！！！")
+        print(f"エラー詳細: {e}")
+        sys.exit(1)
 
-except Exception as e:
-    print(f"エラーが発生しました。変更をロールバックします: {e}")
-    session.rollback()
-    sys.exit(1)
-finally:
-    session.close()
+    print(f"--- {SCHEMA_NAME}.{TABLE_NAME} へのデータ追記処理が正常に完了しました ---")
 
-print("処理が正常に終了しました。")
+
+if __name__ == "__main__":
+    main()
